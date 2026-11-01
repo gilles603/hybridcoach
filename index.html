@@ -147,7 +147,8 @@ const weeksUntil = s => Math.ceil((parseD(s) - new Date())/(7*864e5));
 const TYPES = {
   strength:{l:"Kraft",c:"var(--str)"}, run:{l:"Laufen",c:"var(--run)"}, bike:{l:"Rad",c:"var(--bike)"},
   swim:{l:"Schwimmen",c:"var(--swim)"}, hyrox:{l:"Hyrox",c:"var(--hyrox)"}, hybrid:{l:"Hybrid",c:"var(--hyrox)"},
-  mobility:{l:"Mobility",c:"var(--mob)"}, rest:{l:"Ruhetag",c:"var(--rest)"}
+  mobility:{l:"Mobility",c:"var(--mob)"}, rest:{l:"Ruhetag",c:"var(--rest)"},
+  brick:{l:"Koppel Rad+Lauf",c:"var(--bike)"}, triathlon:{l:"Triathlon",c:"var(--swim)"}
 };
 const T = t => TYPES[t] || TYPES.hybrid;
 
@@ -157,7 +158,7 @@ function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("sh
 const KEYS = ["profile","plan","logs","season","chat","history","imported","conn"];
 const DEF = {
   profile:{ onboarded:false, name:"", goals:"", level:"mittel", days:5, minutes:60, sports:["strength","run"], equipment:"Fitnessstudio", limitations:"", lang:"de" },
-  plan:null, logs:{}, season:{ events:[] }, chat:[], history:[], imported:[], conn:{ gemKey:"", gemModel:"gemini-2.5-flash", icuKey:"", icuId:"0", autoPush:true, lastSync:0 }
+  plan:null, logs:{}, season:{ events:[] }, chat:[], history:[], imported:[], conn:{ gemKey:"", gemModel:"", icuKey:"", icuId:"0", autoPush:true, lastSync:0 }
 };
 const S = {}; const LS = "hybridcoach_v1_";
 for (const k of KEYS){ let v=null; try{ v = JSON.parse(localStorage.getItem(LS+k)); }catch(e){} S[k] = v ?? structuredClone(DEF[k]); }
@@ -172,11 +173,24 @@ function gemSchema(x){
   if (x && typeof x==="object"){ const o={}; for (const [k,v] of Object.entries(x)) o[k] = k==="type" && typeof v==="string" ? v.toUpperCase() : gemSchema(v); return o; }
   return x;
 }
-async function gemCall(contents, {tools, json}={}){
+async function pickModel(){
+  let r; try{ r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200", { headers:{ "x-goog-api-key": S.conn.gemKey } }); }catch(e){ throw Object.assign(new Error("Keine Internetverbindung zur Google-KI"),{code:"network"}); }
+  if (!r.ok){ let msg=""; try{ msg=(await r.json()).error?.message||""; }catch(e){} throw Object.assign(new Error("Google-KI-Schlüssel ungültig oder gesperrt. "+msg),{code:"bad_key"}); }
+  const j = await r.json();
+  const ver = n => { const m = n.match(/(\d+(?:\.\d+)?)/); return m ? parseFloat(m[1]) : 0; };
+  const names = (j.models||[]).filter(m=>(m.supportedGenerationMethods||[]).includes("generateContent")).map(m=>m.name.replace(/^models\//,""));
+  const flash = names.filter(n=>/flash/.test(n) && !/image|tts|audio|live|embed|vision|robot|computer/.test(n));
+  const score = n => ver(n)*100 - (/lite/.test(n)?30:0) - (/preview|exp/.test(n)?10:0) - (/\d{2}-\d{2}|\d{3}$/.test(n)?1:0);
+  const best = (flash.length?flash:names.filter(n=>/gemini/.test(n))).sort((a,b)=>score(b)-score(a))[0];
+  if (!best) throw Object.assign(new Error("Kein passendes Google-KI-Modell für diesen Schlüssel gefunden"),{code:"no_model"});
+  S.conn.autoModel = best; save("conn"); return best;
+}
+async function gemCall(contents, opts={}, retried){
+  const {tools, json} = opts;
   const body = { contents, generationConfig:{ temperature:0.7 } };
   if (json) body.generationConfig.responseMimeType = "application/json";
   if (tools?.length) body.tools = [{ functionDeclarations: tools.map(t=>({ name:t.name, description:t.description, parameters: gemSchema(t.inputSchema) })) }];
-  const model = S.conn.gemModel || "gemini-2.5-flash";
+  const model = S.conn.gemModel || S.conn.autoModel || await pickModel();
   let r;
   try{
     r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
@@ -184,6 +198,12 @@ async function gemCall(contents, {tools, json}={}){
   }catch(e){ throw Object.assign(new Error("Keine Internetverbindung zur Google-KI"),{code:"network"}); }
   if (!r.ok){
     let msg=""; try{ msg=(await r.json()).error?.message||""; }catch(e){}
+    if ((r.status===404 || /no longer available|not found|is not supported/i.test(msg)) && !retried){
+      const sug = msg.match(/models\/([\w.\-]+)/g)?.map(x=>x.slice(7)).filter(x=>x!==model).pop();
+      S.conn.gemModel = ""; S.conn.autoModel = sug || ""; save("conn");
+      if (!S.conn.autoModel) await pickModel();
+      return gemCall(contents, opts, true);
+    }
     if (r.status===429) throw Object.assign(new Error("Gratis-Kontingent der Google-KI gerade aufgebraucht – kurz warten oder morgen wieder."),{code:"rate_limited"});
     if (r.status===400||r.status===401||r.status===403) throw Object.assign(new Error("Google-KI-Schlüssel ungültig oder gesperrt. "+msg),{code:"bad_key"});
     throw Object.assign(new Error("Google-KI Fehler "+r.status+" "+msg),{code:"upstream"});
@@ -243,7 +263,7 @@ function recentText(){
   const rms = oneRMs().slice(0,6).map(r=>`${r.name}: ~${r.rm} kg`).join(", ");
   return logs.map(l=>`- ${l.date} ${l.title} (RPE ${l.rpe||"?"})${l.note?": "+l.note:""}`).join("\n") + (rms?`\nGeschätzte 1RM: ${rms}`:"") + `\nKonstanz letzte 4 Wochen: ${consistency(28)}%`;
 }
-const PLAN_SCHEMA = `{"focus":"Wochenfokus kurz","phase":"z.B. Grundlage/Aufbau/Peak/Tapering","days":[{"date":"YYYY-MM-DD","title":"kurzer Titel","type":"strength|run|bike|swim|hyrox|hybrid|mobility|rest","durationMin":60,"intensity":"leicht|moderat|hart","notes":"Coaching-Hinweis","garmin":"NUR bei Lauf/Rad/Schwimmen: Workout-Schritte im intervals.icu-Textformat, sonst leerer String","items":[{"name":"Übung","kind":"strength|cardio","sets":4,"reps":"6","load":"80 kg oder RPE 8","target":"z.B. 5:30 min/km, Zone 2, 8x400m","notes":""}]}]}
+const PLAN_SCHEMA = `{"focus":"Wochenfokus kurz","phase":"z.B. Grundlage/Aufbau/Peak/Tapering","days":[{"date":"YYYY-MM-DD","title":"kurzer Titel","type":"strength|run|bike|swim|brick|hyrox|hybrid|mobility|rest","durationMin":60,"intensity":"leicht|moderat|hart","notes":"Coaching-Hinweis","garmin":"NUR bei Lauf/Rad/Schwimmen/Koppel: Workout-Schritte im intervals.icu-Textformat, sonst leerer String","items":[{"name":"Übung","kind":"strength|cardio","sets":4,"reps":"6","load":"80 kg oder RPE 8","target":"z.B. 5:30 min/km, Zone 2, 8x400m","notes":""}]}]}
 
 Format für "garmin" (nur Herzfrequenz-Zonen Z1-Z5 mit "HR", Zeilen mit "- ", Abschnitte durch Leerzeile getrennt, Wiederholungen als "Main Set 5x"), Beispiel:
 "Warmup\n- 10m Z1 HR\n\nMain Set 5x\n- 3m Z4 HR\n- 2m Z1 HR\n\nCooldown\n- 10m Z1 HR"`;
@@ -278,7 +298,8 @@ ${seasonText()}
 LETZTE TRAININGS:
 ${recentText()}
 ${extra?`\nZUSÄTZLICHER WUNSCH: ${extra}\n`:""}
-Regeln: Genau ${S.profile.days} Trainingstage, Rest Ruhe- oder Mobility-Tage. Harte und leichte Tage sinnvoll verteilen, keine schweren Beine vor Intervall-Läufen. Krafteinheiten mit konkreten Übungen, Sätzen, Wiederholungen und Gewicht (falls 1RM bekannt in kg, sonst RPE). Ausdauereinheiten mit konkreter Struktur (Dauer/Distanz, Pace oder Zone). Pro Einheit max. ${S.profile.minutes} Minuten. Sprache Deutsch.
+Regeln: Genau ${S.profile.days} Trainingstage, Rest Ruhe- oder Mobility-Tage. Harte und leichte Tage sinnvoll verteilen, keine schweren Beine vor Intervall-Läufen. Krafteinheiten mit konkreten Übungen, Sätzen, Wiederholungen und Gewicht (falls 1RM bekannt in kg, sonst RPE). Ausdauereinheiten mit konkreter Struktur (Dauer/Distanz, Pace oder Zone). Pro Einheit max. ${S.profile.minutes} Minuten (lange Rad- oder Laufeinheit am Wochenende darf länger sein, wenn ein Ausdauer-Wettkampf ansteht). Sprache Deutsch.${S.profile.sports.includes("triathlon")?`
+TRIATHLON: Der Athlet trainiert für Triathlon. Jede Woche Schwimmen, Radfahren und Laufen (je mind. 1x, Schwerpunkt nach Schwäche/Phase), ab der Aufbauphase 1 Koppeltraining (type "brick": Rad direkt gefolgt von kurzem Lauf, beide als items). Schwimmen mit konkreten Sätzen (z.B. 8x100 m, Technik-Drills), Rad/Lauf mit Zonen. Krafttraining 1-2x als Ergänzung (Rumpf, Beine, Schultern). Wähle Distanzen passend zum Wettkampf (Sprint/Olympisch/70.3/Ironman).`:""}
 
 Antworte NUR mit JSON in genau diesem Format:
 ${PLAN_SCHEMA}`;
@@ -297,6 +318,24 @@ function templateWeek(start){
   const E = t => ({run:{title:"Lockerer Dauerlauf",target:"Zone 2, Gesprächstempo"},bike:{title:"Grundlage Rad",target:"Zone 2"},swim:{title:"Technik Schwimmen",target:"10x100 m locker"}})[t];
   const I = {title:"Intervall-Lauf",type:"run",target:"6x800 m @ 10-km-Tempo, 2 min Trabpause"};
   const H = {title:"Hybrid Conditioning",type:sp.includes("hyrox")?"hyrox":"hybrid",items:[["Rudern",1,"1000 m","zügig"],["Wall Balls",4,"20","9/6 kg"],["Farmer Carry",4,"40 m","schwer"],["Burpee Broad Jumps",4,"10",""]]};
+  if (sp.includes("triathlon")){
+    const tri = [
+      {title:"Schwimmen Technik",type:"swim",target:"Einschwimmen 300 m, 8x50 m Drills, 6x100 m locker"},
+      {title:"Rad Grundlage",type:"bike",target:"Zone 2, gleichmäßige Trittfrequenz 85-95"},
+      {title:"Kraft & Rumpf",type:"strength",items:[["Kniebeuge",3,"8","RPE 7"],["Rumänisches Kreuzheben",3,"8","RPE 7"],["Klimmzüge",3,"6-8","Körpergewicht"],["Plank",3,"45 s",""]]},
+      {title:"Lauf Intervalle",type:"run",target:"6x3 min Zone 4, 2 min Trabpause"},
+      {title:"Schwimmen Ausdauer",type:"swim",target:"4x400 m gleichmäßig, 30 s Pause"},
+      {title:"Koppeltraining",type:"brick",items:[["Rad",1,"","Zone 2–3"],["Lauf direkt danach",1,"","15 min Zone 2"]]},
+      {title:"Langer Lauf",type:"run",target:"Zone 2, locker"}];
+    const days=[];
+    for (let i=0;i<7;i++){ const k=slots.indexOf(i);
+      if (k<0){ days.push({date:iso(addDays(start,i)),type:"rest",title:"Ruhetag",notes:"Regeneration, Schlaf, Mobility."}); continue; }
+      const w=tri[k%tri.length];
+      const items = w.items ? w.items.map(([name,sets,reps,load])=>({name,kind:w.type==="brick"?"cardio":"strength",sets,reps,load,target:w.type==="brick"?load:""})) : [{name:w.title,kind:"cardio",sets:1,reps:"",load:"",target:w.target}];
+      days.push({date:iso(addDays(start,i)),type:w.type,title:w.title,durationMin:p.minutes,intensity:/Intervall/.test(w.title)?"hart":"moderat",items});
+    }
+    return normalizePlan({focus:"Triathlon: Schwimmen, Rad, Laufen",phase:"Grundlage",days,source:"template"}, start);
+  }
   const seq = [S1, {...E(endu[0]),type:endu[0]}, S2, I, H, {...E(endu[1%endu.length]),type:endu[1%endu.length],title:"Langer Grundlagentag"}, {title:"Mobility & Core",type:"mobility",items:[["Mobility-Flow",1,"20 min",""]]}];
   const days = [];
   for (let i=0;i<7;i++){
@@ -552,7 +591,7 @@ async function icu(path, opts={}){
   const t = await r.text(); try{ return t ? JSON.parse(t) : null; }catch(e){ return null; }
 }
 const ICU_KIND = t => { t=t||""; if(/Run/.test(t)) return "run"; if(/Ride|Cycl/.test(t)) return "bike"; if(/Swim/.test(t)) return "swim"; if(/Weight|Strength/.test(t)) return "strength"; if(/Walk|Hike/.test(t)) return "walk"; if(/Row/.test(t)) return "row"; return "hybrid"; };
-const ICU_TYPE = {strength:"WeightTraining",run:"Run",bike:"Ride",swim:"Swim",hyrox:"Workout",hybrid:"Workout",mobility:"Yoga"};
+const ICU_TYPE = {brick:"Ride",strength:"WeightTraining",run:"Run",bike:"Ride",swim:"Swim",hyrox:"Workout",hybrid:"Workout",mobility:"Yoga"};
 async function gunzipMaybe(buf){
   const u = new Uint8Array(buf, 0, 2);
   if (u[0]===0x1f && u[1]===0x8b && window.DecompressionStream) return new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
@@ -589,7 +628,7 @@ async function syncGarmin(manual){
 }
 function garminDesc(d){
   const lines=[];
-  if (d.garmin && ["run","bike","swim"].includes(d.type)) lines.push(d.garmin.trim(), "");
+  if (d.garmin && ["run","bike","swim","brick"].includes(d.type)) lines.push(d.garmin.trim(), "");
   else if (["run","bike","swim"].includes(d.type) && d.durationMin) lines.push(`- ${d.durationMin}m ${d.intensity==="hart"?"Z3":"Z2"} HR`, "");
   if (d.notes) lines.push(d.notes);
   for (const it of d.items){
@@ -673,11 +712,13 @@ function ensureCurrentWeek(){
   }
 }
 
+const SPORTS = [["strength","Kraft"],["run","Laufen"],["bike","Rad"],["swim","Schwimmen"],["triathlon","Triathlon"],["hyrox","Hyrox"],["mobility","Mobility"]];
+function toggleSport(arr, k){ const i=arr.indexOf(k); if (i<0){ arr.push(k); if (k==="triathlon") for (const x of ["swim","bike","run"]) if(!arr.includes(x)) arr.push(x); } else arr.splice(i,1); }
 /* onboarding */
 let ob = null;
 function viewOnboarding(){
   ob = ob || structuredClone(S.profile);
-  const sp = [["strength","Kraft"],["run","Laufen"],["bike","Rad"],["swim","Schwimmen"],["hyrox","Hyrox"],["mobility","Mobility"]];
+  const sp = SPORTS;
   return `
   <div style="padding-top:20px">
     <div class="brand" style="margin-bottom:26px">${LOGO}HybridCoach</div>
@@ -875,6 +916,9 @@ function profileSheet(){
     <div class="row between"><h2 style="margin:0">Profil</h2><button class="iconbtn" data-act="closeSheet">${ICON.x}</button></div>
     <label class="f">Name</label><input class="i" data-pf="name" value="${esc(p.name)}">
     <label class="f">Ziele</label><textarea class="i" data-pf="goals">${esc(p.goals)}</textarea>
+    <label class="f">Sportarten</label>
+    <div class="chips">${SPORTS.map(([k,l])=>`<button class="chip ${p.sports.includes(k)?"on":""}" data-pfsport="${k}">${l}</button>`).join("")}</div>
+    <p class="dim small" style="margin:6px 0 0">Nach einer Änderung unter „Woche“ → „Woche neu planen“ tippen.</p>
     <div class="grid2" style="margin:0"><div><label class="f">Tage/Woche</label><select class="i" data-pf="days">${[2,3,4,5,6,7].map(n=>`<option ${+p.days===n?"selected":""}>${n}</option>`).join("")}</select></div>
     <div><label class="f">Minuten</label><select class="i" data-pf="minutes">${[30,45,60,75,90,120].map(n=>`<option ${+p.minutes===n?"selected":""}>${n}</option>`).join("")}</select></div></div>
     <label class="f">Ausstattung</label><input class="i" data-pf="equipment" value="${esc(p.equipment)}">
@@ -946,7 +990,7 @@ function garminSheet(){
       <label class="f">Google-KI-Schlüssel</label>
       <input class="i" id="gemKey" type="password" autocomplete="off" value="${esc(c.gemKey)}" placeholder="AIza…">
       <label class="f">Modell</label>
-      <select class="i" id="gemModel">${[["gemini-2.5-flash","Gemini 2.5 Flash (empfohlen)"],["gemini-2.5-flash-lite","Gemini 2.5 Flash-Lite (mehr Gratis-Anfragen)"],["gemini-2.5-pro","Gemini 2.5 Pro (schlauer, weniger gratis)"]].map(([v,l])=>`<option value="${v}" ${c.gemModel===v?"selected":""}>${l}</option>`).join("")}</select>
+      <select class="i" id="gemModel">${[["","Automatisch – neuestes Modell"+(c.autoModel?" ("+c.autoModel+")":"")],...(c.gemModel?[[c.gemModel,c.gemModel]]:[])].map(([v,l])=>`<option value="${v}" ${c.gemModel===v?"selected":""}>${esc(l)}</option>`).join("")}</select>
       <button class="btn block" style="margin-top:12px" data-act="saveGem" ${busy.gemTest?"disabled":""}>${busy.gemTest?'<span class="spinner"></span> Teste …':"Speichern & testen"}</button>
       <details style="margin-top:14px"><summary class="small" style="cursor:pointer;font-weight:600">Schlüssel holen (1 Minute)</summary>
         <ol class="small" style="padding-left:20px;line-height:1.7;margin:10px 0 0">
@@ -1072,7 +1116,7 @@ LETZTE TRAININGS: ${recentText()}`, { modelTier:"complex" });
 
 /* ============ events ============ */
 document.addEventListener("click", async e => {
-  const el = e.target.closest("[data-act],[data-tab],[data-sel],[data-open],[data-openlog],[data-obsport],[data-oblevel],[data-setdone],[data-cdone],[data-addset],[data-rmset],[data-rpe],[data-delev],[data-quick],[data-close]");
+  const el = e.target.closest("[data-act],[data-tab],[data-sel],[data-open],[data-openlog],[data-obsport],[data-pfsport],[data-oblevel],[data-setdone],[data-cdone],[data-addset],[data-rmset],[data-rpe],[data-delev],[data-quick],[data-close]");
   if (!el) return;
   const ds = el.dataset;
   if (ds.close && e.target===el){ sheet=null; render(); return; }
@@ -1080,7 +1124,8 @@ document.addEventListener("click", async e => {
   if (ds.sel){ selDate=ds.sel; return render(); }
   if (ds.open){ selDate=ds.open; return setTab("heute"); }
   if (ds.openlog){ const d=ds.openlog; if (S.plan?.days.some(x=>x.date===d)){ selDate=d; return setTab("heute"); } const l=S.logs[d]; toast(`${l.title}: RPE ${l.rpe||"–"}${l.note?" · "+l.note:""}`); return; }
-  if (ds.obsport){ const s=ob.sports; const i=s.indexOf(ds.obsport); i<0?s.push(ds.obsport):s.splice(i,1); return render(); }
+  if (ds.obsport){ toggleSport(ob.sports, ds.obsport); return render(); }
+  if (ds.pfsport){ toggleSport(S.profile.sports, ds.pfsport); save("profile"); return render(); }
   if (ds.oblevel){ ob.level=ds.oblevel; return render(); }
   if (ds.setdone){ const [i,j]=ds.setdone.split(".").map(Number); const l=S.logs[selDate]; const s=l.items[i].sets[j]; s.done=!s.done; save("logs"); return render(); }
   if (ds.cdone){ const l=S.logs[selDate]; const it=l.items[+ds.cdone]; it.done=!it.done; save("logs"); return render(); }
@@ -1113,10 +1158,10 @@ document.addEventListener("click", async e => {
     render();
   }
   if (a==="saveGem"){
-    S.conn.gemKey = $("#gemKey").value.trim(); S.conn.gemModel = $("#gemModel").value; save("conn"); initCaps();
+    const newKey = $("#gemKey").value.trim(); if (newKey!==S.conn.gemKey) S.conn.autoModel=""; S.conn.gemKey = newKey; S.conn.gemModel = $("#gemModel").value; save("conn"); initCaps();
     if (!sample){ toast("KI-Coach ausgeschaltet"); render(); return; }
     busy.gemTest=true; render();
-    try{ await sample("Antworte nur mit: OK"); toast("KI-Coach aktiv ✔"); }catch(err){ toast(err.message); }
+    try{ await sample("Antworte nur mit: OK"); toast("KI-Coach aktiv ✔ ("+(S.conn.gemModel||S.conn.autoModel)+")"); }catch(err){ toast(err.message); }
     busy.gemTest=false; render();
   }
   if (a==="downloadExport"){ const b=new Blob([JSON.stringify({...S, conn:{...S.conn, gemKey:"", icuKey:""}})],{type:"application/json"}); const u=URL.createObjectURL(b); const el2=document.createElement("a"); el2.href=u; el2.download="hybridcoach-backup-"+today()+".json"; document.body.appendChild(el2); el2.click(); el2.remove(); setTimeout(()=>URL.revokeObjectURL(u),2000); }
